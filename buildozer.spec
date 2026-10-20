@@ -5,7 +5,7 @@ package.domain = org.example
 source.dir = .
 source.include_exts = py
 version = 0.1
-requirements = python3,kivy==2.3.0,plyer,pyjnius
+requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,plyer,pyjnius
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE
