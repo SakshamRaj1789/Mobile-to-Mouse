@@ -356,7 +356,7 @@ class PhoneMouseApp(App):
         #   tilt up/down   (rotation about X) -> cursor Y
         k = self.speed.value                 # pixels per radian
         dx = -ay * k
-        dy = ax * k
+        dy = -ax * k
         self.link.send(f"M {dx:.2f} {dy:.2f}")
 
     def on_pause(self):
