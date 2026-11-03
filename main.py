@@ -1,6 +1,10 @@
-"""PhoneMouse - Android app (Kivy, pure Python).
+"""PhoneMouse - Android app (Kivy, pure Python).  Low-latency version.
 
 Gyroscope moves the cursor, left/right pads click, centre strip scrolls.
+
+Lag fix: plyer reads the gyroscope at Android's slowest rate (~5 Hz).
+This version registers its own sensor listener at ~200 Hz through pyjnius
+and sends cursor movement straight from the sensor thread.
 """
 import socket
 import threading
@@ -18,18 +22,26 @@ from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.widget import Widget
-from plyer import gyroscope
+
+try:
+    from jnius import PythonJavaClass, autoclass, java_method
+    ON_ANDROID = True
+except ImportError:          # running on a desktop: no gyro
+    ON_ANDROID = False
 
 TCP_PORT = 5005
 DISCOVERY_PORT = 5006
-DEADZONE = 0.03          # rad/s ignored (kills hand jitter / drift)
-SCROLL_DIR = -1          # flip to +1 if scrolling feels inverted
-SCROLL_GAIN = 1 / dp(18) # one wheel notch per ~18dp of finger travel
+DEADZONE = 0.03           # rad/s ignored (kills hand jitter / drift)
+SAMPLE_US = 5000          # sensor period in microseconds (5000 = 200 Hz)
+SCROLL_DIR = -1           # flip to +1 if scrolling feels inverted
+SCROLL_GAIN = 1 / dp(18)  # one wheel notch per ~18dp of finger travel
 Window.clearcolor = (0.08, 0.09, 0.11, 1)
 
 
 class Link:
-    sock = None
+    def __init__(self):
+        self.sock = None
+        self.lock = threading.Lock()   # UI thread and sensor thread both send
 
     def find_pc(self, timeout=2.5):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -55,19 +67,86 @@ class Link:
         self.sock = s
 
     def send(self, msg):
-        if self.sock:
-            try:
-                self.sock.sendall((msg + "\n").encode())
-            except OSError:
-                self.close()
+        s = self.sock
+        if not s:
+            return
+        try:
+            with self.lock:
+                s.sendall((msg + "\n").encode())
+        except OSError:
+            self.close()
 
     def close(self):
-        if self.sock:
+        s, self.sock = self.sock, None
+        if s:
             try:
-                self.sock.close()
+                s.close()
             except OSError:
                 pass
-        self.sock = None
+
+
+if ON_ANDROID:
+    class _SensorListener(PythonJavaClass):
+        __javainterfaces__ = ["android/hardware/SensorEventListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method("(Landroid/hardware/SensorEvent;)V")
+        def onSensorChanged(self, event):
+            v = event.values
+            self.callback(v[0], v[1], v[2], event.timestamp)
+
+        @java_method("(Landroid/hardware/Sensor;I)V")
+        def onAccuracyChanged(self, sensor, accuracy):
+            pass
+
+
+class Gyro:
+    """Fast gyroscope reader. Calls emit(angle_x, angle_y) in radians per sample."""
+
+    def __init__(self, emit):
+        self.emit = emit
+        self.sm = None
+        self.listener = None
+        self.last_ts = None
+
+    def start(self):
+        if not ON_ANDROID:
+            raise RuntimeError("Gyroscope only works on Android")
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        context = autoclass("android.content.Context")
+        sensor_cls = autoclass("android.hardware.Sensor")
+        self.sm = activity.getSystemService(context.SENSOR_SERVICE)
+        sensor = self.sm.getDefaultSensor(sensor_cls.TYPE_GYROSCOPE)
+        if sensor is None:
+            raise RuntimeError("No gyroscope on this device")
+        self.last_ts = None
+        self.listener = _SensorListener(self._on_sample)
+        self.sm.registerListener(self.listener, sensor, SAMPLE_US)
+
+    def stop(self):
+        if self.sm and self.listener:
+            try:
+                self.sm.unregisterListener(self.listener)
+            except Exception:
+                pass
+        self.listener = None
+
+    def _on_sample(self, x, y, z, ts):
+        if self.last_ts is None:
+            self.last_ts = ts
+            return
+        dt = (ts - self.last_ts) * 1e-9      # real time between samples
+        self.last_ts = ts
+        if dt <= 0 or dt > 0.1:
+            return
+        x = 0.0 if abs(x) < DEADZONE else x
+        y = 0.0 if abs(y) < DEADZONE else y
+        if x or y:
+            self.emit(x * dt, y * dt)        # rotation angle (rad)
 
 
 class Pad(Widget):
@@ -154,10 +233,11 @@ class PhoneMouseApp(App):
     def build(self):
         self.title = "PhoneMouse"
         self.link = Link()
+        self.gyro = Gyro(self.on_gyro)
         self.sm = ScreenManager(transition=NoTransition())
         self.sm.add_widget(self.build_connect())
         self.sm.add_widget(self.build_control())
-        Clock.schedule_interval(self.tick, 1 / 60)
+        Clock.schedule_interval(self.watch_link, 0.5)
         return self.sm
 
     # ---------- connect screen ----------
@@ -222,9 +302,9 @@ class PhoneMouseApp(App):
             self.set_status(err)
             return
         try:
-            gyroscope.enable()
-        except Exception:
-            self.set_status("No gyroscope available on this device")
+            self.gyro.start()
+        except Exception as e:
+            self.set_status(str(e))
             self.link.close()
             return
         self.sm.current = "control"
@@ -258,50 +338,35 @@ class PhoneMouseApp(App):
         return scr
 
     def disconnect(self, msg):
+        self.gyro.stop()
         self.link.close()
-        try:
-            gyroscope.disable()
-        except Exception:
-            pass
         self.set_status(msg)
         self.sm.current = "connect"
 
-    # ---------- gyro -> cursor ----------
-    @staticmethod
-    def dead(v):
-        return 0.0 if abs(v) < DEADZONE else v
-
-    def tick(self, dt):
-        if self.sm.current != "control":
-            return
-        if not self.link.sock:
+    def watch_link(self, dt):
+        if self.sm.current == "control" and not self.link.sock:
             self.disconnect("Connection lost")
-            return
+
+    # ---------- gyro -> cursor (runs on the sensor thread) ----------
+    def on_gyro(self, ax, ay):
         if self.gyro_btn.state != "down":
             return
-        try:
-            v = gyroscope.rotation  # angular velocity (x, y, z) in rad/s
-        except Exception:
-            return
-        if not v or None in v:
-            return
-        gx, gy, _gz = (self.dead(a) for a in v)
-        dt = min(dt, 0.05)
         # Phone held upright, screen facing you:
         #   turn left/right (rotation about Y) -> cursor X
         #   tilt up/down   (rotation about X) -> cursor Y
-        dx = -gy * dt * self.speed.value
-        dy = gx * dt * self.speed.value
-        if dx or dy:
-            self.link.send(f"M {dx:.2f} {dy:.2f}")
+        k = self.speed.value                 # pixels per radian
+        dx = -ay * k
+        dy = ax * k
+        self.link.send(f"M {dx:.2f} {dy:.2f}")
 
     def on_pause(self):
+        self.gyro.stop()
         return True
 
     def on_resume(self):
         if self.sm.current == "control":
             try:
-                gyroscope.enable()
+                self.gyro.start()
             except Exception:
                 pass
 
